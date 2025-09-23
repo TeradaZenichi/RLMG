@@ -1,0 +1,30 @@
+{
+  "algo": "sac",
+  "network": {
+    "hidden_dims": [256, 256],
+    "activation": "silu",
+    "init": "orthogonal",
+    "log_std_min": -5.0,
+    "log_std_max": 2.0
+  },
+  "training": {
+    "gamma": 0.99,
+    "tau": 0.005,
+    "alpha": null,                
+    "target_entropy": null, 
+    "lr_actor": 0.0003,
+    "lr_critic": 0.0003,
+    "lr_alpha": 0.0003,
+    "batch_size": 256,
+    "buffer_size": 50000,
+    "learning_starts": 1000,
+    "gradient_steps": 1,
+    "updates_per_step": 1,
+    "target_update_interval": 1,
+    "max_grad_norm": 10.0
+  },
+  "env": {
+    "normalize_obs": false,
+    "normalize_reward": false
+  }
+}
