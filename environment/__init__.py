@@ -1,558 +1,203 @@
-# environment/__init__.py
+# energy_env.py
+# Gymnasium env minimal: +Pbess = charge, −Pbess = discharge.
+import numpy as np
+import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
-import numpy as np
-from typing import Tuple, Dict, Any
-from .config import EnergyEnvConfig
+from datetime import datetime
 
-__all__ = ["EnergyEnvSimpleNP", "EnergyEnvConfig"]
+class Battery:
+    def __init__(self, p):
+        eff = float(p.get("efficiency", 0.95))
+        self.ηc = float(p.get("eta_c", eff))
+        self.ηd = float(p.get("eta_d", eff))
+        self.Pmax = float(p["Pmax"])
+        self.Emax = float(p["Emax"])
+        self.soc_min = float(p.get("soc_min", 0.0))
+        self.soc_max = float(p.get("soc_max", 1.0))
+        self.β = float(p.get("self_discharging", 0.0))  # per hour
+        r = p.get("ramp_kw_per_step", 0.0)
+        self.ramp = None if (r is None or float(r) <= 0) else float(r)
+    @property
+    def Emin(self): return self.Emax * self.soc_min
+    @property
+    def Ecap(self): return self.Emax * self.soc_max
 
+class Load:
+    def __init__(self, p):
+        self.Pmax = float(p["Pmax"])
+        self.df = pd.read_csv(p["load_file"], index_col=0, parse_dates=True)
+    def fload(self, t): return float(self.df.loc[t].values[0]) * self.Pmax
 
-class EnergyEnvSimpleNP(gym.Env):
-    """
-    NumPy-only simple BESS environment (energy-conserving + shaping & salvage + safety layer).
+class PV:
+    def __init__(self, p):
+        self.Pmax = float(p["Pmax"])
+        self.df = pd.read_csv(p["generation_file"], index_col=0, parse_dates=True)
+    def fpv(self, t): return float(self.df.loc[t].values[0]) * self.Pmax
 
-    Base data:
-      - Resolução base: 5 minutos.
-      - O passo de simulação pode ser {5,10,15,30,60} min (agregando a base).
-      - Início por data (YYYY-MM-DD).
+class EDS:
+    def __init__(self, p):
+        self.Pmax_in  = float(p.get("Pmax_in",  np.inf))
+        self.Pmax_out = float(p.get("Pmax_out", np.inf))
 
-    Observação (14 dims, ordem exata):
-      [ pv_frac, load_frac, pv_to_load_ratio, net_load_frac, price_norm,
-        sin_tod, cos_tod, sin_dow, cos_dow, sin_mon, cos_mon, sin_dom, cos_dom,
-        soc ]
-        - pv_frac          = PV(kW)/PV_Pmax_kw
-        - load_frac        = Load(kW)/Load_Pmax_kw
-        - pv_to_load_ratio = clip( PV/Load , 0..3 )
-        - net_load_frac    = (Load-PV)/Load_Pmax_kw
-        - price_norm       = (price - price_min)/(price_max - price_min)
-        - sin/cos 'tod'    = tempo-do-dia por minuto (0..1439)
-        - sin/cos 'dow'    = dia da semana (0..6)
-        - sin/cos 'mon'    = mês do ano (0..11)
-        - sin/cos 'dom'    = dia do mês (0..n_mês-1)
-        - soc              = estado de carga (fração)
-    """
+class EnergyEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    # ---------- helpers (estáticos) ----------
-    @staticmethod
-    def _hours_from_times(t_m: np.ndarray) -> np.ndarray:
-        return (t_m.astype("datetime64[h]").astype(int) % 24).astype(np.int32)
-
-    @staticmethod
-    def _date_of(t_m: np.ndarray) -> np.ndarray:
-        return t_m.astype("datetime64[D]")
-
-    @staticmethod
-    def _weekday_of(t_m_scalar: np.datetime64) -> int:
-        days = t_m_scalar.astype("datetime64[D]").astype(int)
-        return int((days + 3) % 7)  # 1970-01-01 é quinta (=3)
-
-    @staticmethod
-    def _minutes_of_day(t_m_scalar: np.datetime64) -> int:
-        t_d = t_m_scalar.astype("datetime64[D]")
-        return int(((t_m_scalar - t_d).astype("timedelta64[m]").astype(int)) % (24*60))
-
-    @staticmethod
-    def _month_index(t_m_scalar: np.datetime64) -> int:
-        m = t_m_scalar.astype("datetime64[M]").astype(int)
-        return int(m % 12)
-
-    @staticmethod
-    def _days_in_month(t_m_scalar: np.datetime64) -> int:
-        m0 = t_m_scalar.astype("datetime64[M]")
-        m1 = (m0 + np.timedelta64(1, "M")).astype("datetime64[D]")
-        m0d = m0.astype("datetime64[D]")
-        return int((m1 - m0d).astype("timedelta64[D]").astype(int))
-
-    @staticmethod
-    def _day_of_month_index(t_m_scalar: np.datetime64) -> int:
-        d = t_m_scalar.astype("datetime64[D]")
-        m0d = t_m_scalar.astype("datetime64[M]").astype("datetime64[D]")
-        return int((d - m0d).astype("timedelta64[D]").astype(int))
-
-    @staticmethod
-    def _aggregate_mean(arr: np.ndarray, k: int) -> np.ndarray:
-        n = (arr.size // k) * k
-        a = arr[:n].reshape(-1, k)
-        return a.mean(axis=1, dtype=np.float32)
-
-    def _grid_limit_penalty_fn(self, excess: float, kind: str, huber_delta: float) -> float:
-        """Penalização suave para excesso (kW > 0)."""
-        if excess <= 0.0:
-            return 0.0
-        if kind == "linear":
-            return excess
-        elif kind == "huber":
-            d = max(huber_delta, 1e-9)
-            return 0.5 * min(excess, d)**2 + d * max(excess - d, 0.0)
-        # default: quadratic
-        return excess * excess
-
-    # ---------- construção ----------
-    def __init__(self,
-                 times_5m_m: np.ndarray,   # datetime64[m]
-                 pv_kw_5m: np.ndarray,     # float32
-                 load_kw_5m: np.ndarray,   # float32
-                 cfg: EnergyEnvConfig):
+    def __init__(self, param, start_time=None, soc_ini=None, horizon_hours=None, timestep=None, window_size: int = 1):
         super().__init__()
-        assert times_5m_m.dtype == "datetime64[m]"
-        assert pv_kw_5m.shape == load_kw_5m.shape == times_5m_m.shape
-        self.cfg = cfg
+        self.bess = Battery(param["BESS"])
+        self.pv   = PV(param["PV"])
+        self.load = Load(param["Load"])
+        self.eds  = EDS(param["EDS"])    
+        
+        self.t0 = pd.Timestamp(start_time)
 
-        # Flags de treino/avaliação
-        self.is_training: bool = False  # altere via set_training_mode() ou reset(options={"mode":...})
+        self.E0 = soc_ini * self.bess.Emax
+        self.E = float(np.clip(float(self.E0), self.bess.Emin, self.bess.Ecap))
 
-        # Física
-        self.eta_ch  = float(getattr(self.cfg, "eta_ch", 1.0))
-        self.eta_dis = float(getattr(self.cfg, "eta_dis", 1.0))
-        self.penalty_violation_kwh = float(getattr(self.cfg, "penalty_violation_kwh", 0.0))
+        self.Δt   = int(timestep)
+        self.Δt_h = self.Δt / 60.0
+        self.horizon_steps = int(round(horizon_hours * 60 / self.Δt)) 
 
-        # Shaping potencial (opcional, só treino)
-        self.use_shaping = bool(getattr(self.cfg, "use_shaping", False))
-        self.lambda_potential = float(getattr(self.cfg, "lambda_potential", 0.0))
+        self.ceds = dict(param.get("costs", {}).get("EDS", {}))
+        self.ceds_max = float(max(self.ceds.values())) if self.ceds else 1.0
+        self.c_curt = float(param.get("costs", {}).get("c_pv_curt_per_kwh", 0.0))
+        self.c_shed = float(param.get("costs", {}).get("load_shedding", 0.0))
 
-        # Valor de sucata por kWh (só treino, último passo)
-        self.salvage_value_per_kwh = float(getattr(self.cfg, "salvage_value_per_kwh", 0.0))
+        self.Pnorm = float(param["EDS"].get("Pmax_in", self.eds.Pmax_in))
+    
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        
+        base_low  = np.array([-1,-1,-1,-1,-1,-1,-1,-1, 0, 0, 0, 0], dtype=np.float32)
+        base_high = np.array([ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], dtype=np.float32)
+        low  = np.tile(base_low,  self.K)
+        high = np.tile(base_high, self.K)
+        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
-        # Limites de potência na rede (kW). Use +inf / -inf para “sem limite”.
-        self.grid_import_kw_max = float(getattr(self.cfg, "grid_import_kw_max", np.inf))
-        self.grid_export_kw_min = float(getattr(self.cfg, "grid_export_kw_min", -np.inf))
+        self.t = self.t0
+        self.k = 0
+        self.E = float(np.clip(self.E, self.bess.Emin, self.bess.Ecap))
+        self.Pb_prev = 0.0  # histórico da rampa em sinal do Teacher (+=carga)
+        self._rows = []
+        self._last_pv_used = self.pv.fpv(self.t0)
+        self._last_load_served = self.load.fload(self.t0)
+        self._hist = np.zeros((self.K, self.F_BASE), dtype=np.float32)
 
-        # Penalidades (opcionais)
-        self.lambda_grid_limits = float(getattr(self.cfg, "lambda_grid_limits", 0.0))
-        self.grid_limit_penalty = str(getattr(self.cfg, "grid_limit_penalty", "quadratic"))
-        self.grid_limit_huber_delta = float(getattr(self.cfg, "grid_limit_huber_delta", 0.25))
-        self.penalize_grid_limits_in_eval = bool(getattr(self.cfg, "penalize_grid_limits_in_eval", False))
 
-        self.lambda_clip = float(getattr(self.cfg, "lambda_clip", 0.0))
-        self.clip_penalty = str(getattr(self.cfg, "clip_penalty", "quadratic"))
-        self.clip_huber_delta = float(getattr(self.cfg, "clip_huber_delta", 0.25))
-
-        # Base (5-min)
-        self.t5  = times_5m_m
-        self.pv5 = pv_kw_5m.astype(np.float32, copy=False)
-        self.ld5 = load_kw_5m.astype(np.float32, copy=False)
-
-        # Tarifa por hora (24 chaves "HH:00")
-        hours = self._hours_from_times(self.t5)
-        self.price5 = np.array([self.cfg.tariff_by_hour[f"{h:02d}:00"] for h in hours], dtype=np.float32)
-
-        # Pesos por hora p/ shaping (se não fornecido, usa tarifa normalizada 0..1)
-        self.hour_weights = self._build_hour_weights(getattr(self.cfg, "price_weight_by_hour", None))
-
-        # Escalas p/ normalização
-        self.pv_kw_max   = float(getattr(self.cfg, "PV_Pmax_kw",  np.nan))
-        self.load_kw_max = float(getattr(self.cfg, "Load_Pmax_kw", np.nan))
-        if not np.isfinite(self.pv_kw_max)   or self.pv_kw_max   <= 0: self.pv_kw_max   = max(1e-6, float(np.nanmax(self.pv5)))
-        if not np.isfinite(self.load_kw_max) or self.load_kw_max <= 0: self.load_kw_max = max(1e-6, float(np.nanmax(self.ld5)))
-
-        # min-max fixo de preço (derivado da própria tarifa por hora)
-        tar = np.array([self.cfg.tariff_by_hour[f"{h:02d}:00"] for h in range(24)], dtype=np.float32)
-        self.price_min = float(np.min(tar))
-        self.price_max = float(np.max(tar))
-        self._price_den = max(1e-6, self.price_max - self.price_min)
-
-        # Runtime buffers
-        self.dt_minutes = int(self.cfg.dt_minutes)
-        self.k = 1
-        self.t = self.t5
-        self.pv = self.pv5
-        self.ld = self.ld5
-        self.price = self.price5
-
-        self.idx = 0
-        self.T = 0
-        self.soc = float(np.clip(self.cfg.soc_init, self.cfg.soc_min, self.cfg.soc_max))
-
-        # Ação: limites de hardware (kW)
-        self.action_space = spaces.Box(
-            low=np.array([-self.cfg.P_dis_max_kw], dtype=np.float32),
-            high=np.array([ self.cfg.P_ch_max_kw], dtype=np.float32),
-            dtype=np.float32,
-        )
-
-        # Observação: 14 dims com bounds conservadores
-        high_vec = self._obs_high_vector()  # shape (14,)
-        self.observation_space = spaces.Box(
-            low=-high_vec,
-            high= high_vec,
-            dtype=np.float32,
-        )
-
-    # ---------- API auxiliar ----------
-    def set_training_mode(self, is_training: bool = True):
-        """Liga/desliga shaping e salvage (apenas treino)."""
-        self.is_training = bool(is_training)
-
-    def _build_hour_weights(self, mapping: Dict[str, Any] | None) -> np.ndarray:
-        """
-        Retorna vetor 24 com pesos por hora (0..23).
-        Se mapping=None: usa a tarifa min-max normalizada (0..1).
-        Se mapping for dict {"HH:00": w} ou {int_hour: w}: usa valores fornecidos.
-        """
-        w = np.zeros(24, dtype=np.float32)
-        if mapping is None:
-            p = np.array([self.cfg.tariff_by_hour[f"{h:02d}:00"] for h in range(24)], dtype=np.float32)
-            pmin, pmax = float(np.min(p)), float(np.max(p))
-            if pmax > pmin:
-                w = (p - pmin) / (pmax - pmin)
-            else:
-                w[:] = 0.0
-            return w
-        for h in range(24):
-            key1 = f"{h:02d}:00"
-            if key1 in mapping:
-                w[h] = float(mapping[key1])
-            elif h in mapping:
-                w[h] = float(mapping[h])
-            else:
-                w[h] = 0.0
-        return w
-
-    def _obs_high_vector(self) -> np.ndarray:
-        """
-        Bounds por componente (low=-high):
-        [ pv_frac(1), load_frac(1), pv_to_load_ratio(3), net_load_frac(2),
-          price_norm(1), sin_tod(1), cos_tod(1), sin_dow(1), cos_dow(1),
-          sin_mon(1), cos_mon(1), sin_dom(1), cos_dom(1), soc(1) ]
-        """
-        return np.array([1.0, 1.0, 3.0, 2.0,
-                         1.0, 1.0, 1.0, 1.0, 1.0,
-                         1.0, 1.0, 1.0, 1.0,
-                         1.0], dtype=np.float32)
-
-    # ---------- agregação ----------
-    def _aggregate_from(self, i0: int, k: int, steps_needed: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        start = i0
-        total_needed_base = steps_needed * k
-        end = min(start + total_needed_base, self.t5.size)
-        usable = ((end - start) // k) * k
-        end = start + usable
-        if usable == 0:
-            return (np.empty(0, dtype="datetime64[m]"),
-                    np.empty(0, dtype=np.float32),
-                    np.empty(0, dtype=np.float32),
-                    np.empty(0, dtype=np.float32))
-        t_block = self.t5[start:end]
-        pv_block = self.pv5[start:end]
-        ld_block = self.ld5[start:end]
-        pr_block = self.price5[start:end]
-        t_out  = t_block[::k]                       # timestamp representativo (primeiro do bloco)
-        pv_out = self._aggregate_mean(pv_block, k)
-        ld_out = self._aggregate_mean(ld_block, k)
-        pr_out = self._aggregate_mean(pr_block, k)  # preço médio no bloco
-        return t_out, pv_out, ld_out, pr_out
-
-    def _select_start_index_by_date(self, start_date_str: str, align: str = "next") -> int:
-        target = np.datetime64(start_date_str, "D")
-        dates = self._date_of(self.t5)
-        uniq = np.unique(dates)
-        if align == "exact":
-            idx = np.nonzero(dates == target)[0]
-            if idx.size == 0:
-                dmin, dmax = uniq.min(), uniq.max()
-                raise ValueError(f"No samples for date {start_date_str}. Available range: {str(dmin)} to {str(dmax)}")
-            return int(idx[0])
-        i = np.searchsorted(uniq, target, side="left")
-        if align == "next":
-            if i >= uniq.size: i = uniq.size - 1
-        elif align == "prev":
-            if i == 0 and uniq[0] > target:
-                i = 0
-            else:
-                if i == uniq.size or uniq[i] != target:
-                    i = max(0, i - 1)
-        else:
-            raise ValueError("align must be one of {'exact','next','prev'}")
-        chosen_day = uniq[i]
-        j = int(np.nonzero(dates == chosen_day)[0][0])
-        return j
-
-    # ---------- Gymnasium API ----------
-    def reset(self, seed=None, options=None):
+    def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        opt = options or {}
-
-        # Alternativa de toggle por reset
-        mode = opt.get("mode", None)
-        if mode == "train":
-            self.set_training_mode(True)
-        elif mode == "eval":
-            self.set_training_mode(False)
-
-        # dt
-        dt_minutes = int(opt.get("dt_minutes", self.cfg.dt_minutes))
-        if dt_minutes not in (5, 10, 15, 30, 60) or dt_minutes % 5 != 0:
-            raise ValueError("dt_minutes must be one of {5,10,15,30,60} and a multiple of 5.")
-        self.dt_minutes = dt_minutes
-        self.k = dt_minutes // 5
-
-        # start date
-        start_date = opt.get("start_date", None)
-        align = opt.get("align", "next")
-        if start_date is None:
-            start_idx_base = 0
-        else:
-            start_idx_base = self._select_start_index_by_date(str(start_date), align=align)
-
-        # horizonte em passos
-        horizon_h = int(opt.get("horizon_hours", self.cfg.horizon_hours))
-        steps_needed = int((horizon_h * 60) // self.dt_minutes)
-
-        # agrega
-        t_out, pv_out, ld_out, pr_out = self._aggregate_from(start_idx_base, self.k, steps_needed)
-        if t_out.size == 0:
-            dmin, dmax = self._date_of(self.t5).min(), self._date_of(self.t5).max()
-            raise ValueError(
-                "Not enough data to build the requested horizon from the selected start date. "
-                f"Available date range: {str(dmin)} to {str(dmax)}"
-            )
-
-        # runtime
-        self.t = t_out
-        self.pv = pv_out
-        self.ld = ld_out
-        self.price = pr_out
-        self.T = self.t.size
-
-        self.idx = 0
-        self.soc = float(np.clip(self.cfg.soc_init, self.cfg.soc_min, self.cfg.soc_max))
-        return self._obs_at(self.idx), {}
+        o = options or {}
+        if "start_time" in o:
+            self.t0 = pd.Timestamp(o["start_time"])
+        if "horizon_hours" in o:
+            self.horizon_steps = int(round(float(o["horizon_hours"]) * 60.0 / float(self.Δt)))
+        self.t = self.t0
+        self.k = 0
+        self.E = float(np.clip(self.E0, self.bess.Emin, self.bess.Ecap))
+        self.Pb_prev = 0.0
+        self._rows.clear()
+        self._last_pv_used = self.pv.fpv(self.t)
+        self._last_load_served = self.load.fload(self.t)
+        price = self._price(self.t)
+        return self._obs(), {"timestamp": self.t, "tariff": price, "tariff_norm": price/self.ceds_max}
 
     def step(self, action):
-        # fim seguro
-        if self.idx >= self.T:
-            info = {"warning": "step_called_after_episode_end"}
-            return self._obs_at(self.T - 1), 0.0, False, True, info
+        a_norm = float(np.asarray(action, dtype=np.float32).reshape(-1)[0])
+        a_norm = float(np.clip(a_norm, -1.0, 1.0))
+        Pb_des = a_norm * self.bess.Pmax
+        Pb_net_cmd = self._apply_ramp(Pb_des, self.Pb_prev)
 
-        # comando (kW) limitado por hardware
-        p_cmd = float(np.clip(action[0], -self.cfg.P_dis_max_kw, self.cfg.P_ch_max_kw))
+        load_kw = self.load.fload(self.t)
+        pv_kw   = self.pv.fpv(self.t)
+        price   = self._price(self.t)
 
-        # estados atuais
-        pv = float(self.pv[self.idx])
-        ld = float(self.ld[self.idx])
-        price = float(self.price[self.idx])
-        t_m = self.t[self.idx]
+        if Pb_net_cmd >= 0.0:  
+            Pch_des, Pdis_des = Pb_net_cmd, 0.0
+        else:                  
+            Pch_des, Pdis_des = 0.0, -Pb_net_cmd
 
-        # tempo & capacidade
-        dt_h = max(self.dt_minutes / 60.0, 1e-9)
-        E = max(self.cfg.E_bess_kwh, 1e-9)
-        soc = float(self.soc)
+        Pdis = min(Pdis_des, self._discharge_cap())
+        Pch  = min(Pch_des,  self._charge_cap())
+        Pb_net_eff = Pch - Pdis  
 
-        # folgas de energia (lado bateria)
-        E_dn = (soc - self.cfg.soc_min) * E
-        E_up = (self.cfg.soc_max - soc) * E
-
-        # pedido no lado AC (antes de qualquer limitação por SoC)
-        e_req_ac = p_cmd * dt_h
-
-        # --------- Limites físicos por passo (p_eff em kW) independentemente de p_cmd ---------
-        # Máximo AC de carga (kW) limitado por SoC/eficiência
-        p_eff_max_physical = (E_up / max(self.eta_ch, 1e-9)) / dt_h
-        # Mínimo AC de descarga (kW negativo)
-        p_eff_min_physical = - (self.eta_dis * E_dn) / dt_h
-        # Limites de hardware (ação em kW, lado AC)
-        p_eff_max_hw = float(self.cfg.P_ch_max_kw)
-        p_eff_min_hw = -float(self.cfg.P_dis_max_kw)
-
-        # --------- Efetivação pelo SoC (sem safety layer ainda): p_eff_phy ---------
-        if e_req_ac >= 0.0:  # carga
-            feasible_ac_max = E_up / max(self.eta_ch, 1e-9)  # kWh no lado AC
-            e_ac_eff = min(e_req_ac, feasible_ac_max)
-            violation_kwh = max(0.0, e_req_ac - feasible_ac_max)
-        else:               # descarga
-            feasible_ac_abs = self.eta_dis * E_dn            # kWh (módulo) no lado AC
-            e_ac_eff = -min(abs(e_req_ac), feasible_ac_abs)
-            violation_kwh = max(0.0, abs(e_req_ac) - feasible_ac_abs)
-        p_eff_phy = e_ac_eff / dt_h  # kW (lado AC) após SoC
-
-        # Clip por hardware (garante coerência com action_space)
-        p_eff_phy = float(np.clip(p_eff_phy, p_eff_min_hw, p_eff_max_hw))
-
-        # --------- SAFETY LAYER: projeção para satisfazer limites de rede por passo ---------
-        net = ld - pv  # parte "fixa" do balanço
-        lo_grid, hi_grid = self.grid_export_kw_min, self.grid_import_kw_max  # grid_p ∈ [lo_grid, hi_grid]
-        # Faixa de p_eff imposta pelos limites de rede
-        p_eff_min_grid = lo_grid - net
-        p_eff_max_grid = hi_grid - net
-
-        # Interseção de TODAS as faixas
-        lo_eff = max(p_eff_min_physical, p_eff_min_hw, p_eff_min_grid)
-        hi_eff = min(p_eff_max_physical, p_eff_max_hw, p_eff_max_grid)
-
-        safety_infeasible = False
-        if lo_eff <= hi_eff:
-            p_eff_star = float(np.clip(p_eff_phy, lo_eff, hi_eff))
+        A = self._close_balance(load_kw, pv_kw, Pdis, Pch)
+        B = self._close_balance(0.0,     pv_kw, Pdis, Pch); B["cost_total"] += self.c_shed * (load_kw * self.Δt_h)
+        choose_B = (A["residual_kw"] > 1e-9) or (B["cost_total"] + 1e-12 < A["cost_total"])
+        if choose_B:
+            served = 0.0
+            Pgrid_in, Pgrid_out, Pcurt, residual, step_cost = B["Pgrid_in_kw"], B["Pgrid_out_kw"], B["Curtailment_kw"], B["residual_kw"], B["cost_total"]
+            XLOAD = 1
         else:
-            # Interseção vazia: fisicamente impossível satisfazer a rede neste passo.
-            # Opta por respeitar a física (SoC/hardware) e contabiliza violação de rede.
-            safety_infeasible = True
-            p_eff_star = float(np.clip(p_eff_phy, p_eff_min_physical, p_eff_max_physical))
-            p_eff_star = float(np.clip(p_eff_star, p_eff_min_hw, p_eff_max_hw))
+            served = load_kw
+            Pgrid_in, Pgrid_out, Pcurt, residual, step_cost = A["Pgrid_in_kw"], A["Pgrid_out_kw"], A["Curtailment_kw"], A["residual_kw"], A["cost_total"]
+            XLOAD = 0
 
-        # Métrica de clipping (educa a política)
-        clip_kw = abs(p_eff_star - p_eff_phy)
+        self.E = float(np.clip(
+            (1.0 - self.bess.β * self.Δt_h) * self.E +
+            self.Δt_h * (self.bess.ηc * Pch - (1.0 / max(self.bess.ηd, 1e-9)) * Pdis),
+            self.bess.Emin, self.bess.Ecap
+        ))
 
-        # Balanço de rede e custo econômico (com p_eff já projetado)
-        grid_p = ld - pv + p_eff_star  # >0 import; <0 export
-        e_buy  = max(grid_p, 0.0) * dt_h
-        e_sell = max(-grid_p, 0.0) * dt_h
-        reward_energy = - (e_buy * price - e_sell * self.cfg.feedin_price)
+        pv_used = max(0.0, pv_kw - Pcurt)
+        self._rows.append(dict(
+            timestamp=self.t, tariff=price, tariff_norm=price/self.ceds_max,
+            Load_kw=load_kw, Load_served_kw=served, Shedding_kw=(load_kw - served),
+            PV_kw=pv_kw, PV_used_kw=pv_used, Curtailment_kw=Pcurt,
+            P_bess_kw=Pb_net_eff,  # log no sinal do Teacher
+            P_bess_discharge_kw=Pdis, P_bess_charge_mag_kw=Pch,
+            P_grid_in_kw=Pgrid_in, P_grid_out_kw=Pgrid_out,
+            Residual_kw=float(residual), XLOAD=int(XLOAD),
+            E_kwh=self.E, SoC_pct=100.0 * self.E / self.bess.Emax,
+            cost_total=step_cost, action_used=Pb_net_cmd
+        ))
 
-        # Penalização por tentativa inviável no SoC (medida no pedido AC original)
-        reward_penalty = - self.penalty_violation_kwh * violation_kwh
+        # histórico da rampa usa o valor EFETIVO aplicado (como no ótimo viável do MILP)
+        self.Pb_prev = Pb_net_eff
+        self._last_pv_used = pv_used
+        self._last_load_served = served
 
-        # Atualização de SoC (usando p_eff_star)
-        e_ac_eff_star = p_eff_star * dt_h
-        if e_ac_eff_star >= 0.0:  # carga
-            e_batt_eff = self.eta_ch * e_ac_eff_star
-            delta_soc = (e_batt_eff / E)
-        else:                     # descarga
-            e_batt_eff = abs(e_ac_eff_star) / max(self.eta_dis, 1e-9)
-            delta_soc = (-e_batt_eff / E)
-        self.soc = float(np.clip(soc + delta_soc, self.cfg.soc_min, self.cfg.soc_max))
+        self.t += pd.Timedelta(minutes=self.Δt); self.k += 1
+        done = self.k >= self.horizon_steps
+        return self._obs(), -float(step_cost), done, False, {"tariff": price, "tariff_norm": price/self.ceds_max, "row": self._rows[-1]}
 
-        # próxima observação
-        next_idx = self.idx + 1
-        truncated = next_idx >= self.T
-        obs_next_idx = self.idx if truncated else next_idx
-        obs_next = self._obs_at(obs_next_idx)
-
-        # --- shaping (apenas treino) ---
-        reward_shaping = 0.0
-        if self.is_training and self.use_shaping and self.lambda_potential != 0.0:
-            hour_now  = int(t_m.astype("datetime64[h]").astype(int) % 24)
-            phi_now   = self.lambda_potential * float(self.hour_weights[hour_now]) * soc
-            t_next = self.t[obs_next_idx]
-            hour_next = int(t_next.astype("datetime64[h]").astype(int) % 24)
-            phi_next  = self.lambda_potential * float(self.hour_weights[hour_next]) * self.soc
-            reward_shaping = (phi_next - phi_now)
-
-        # --- salvage (apenas treino, último passo) ---
-        reward_salvage = 0.0
-        if self.is_training and truncated and self.salvage_value_per_kwh != 0.0:
-            reward_salvage = self.salvage_value_per_kwh * E * self.soc
-
-        # ----- Penalização por ultrapassar limites de rede -----
-        ex_imp = ex_exp = 0.0
-        if np.isfinite(self.grid_import_kw_max):
-            ex_imp = max(0.0, grid_p - self.grid_import_kw_max)
-        if np.isfinite(self.grid_export_kw_min):
-            ex_exp = max(0.0, self.grid_export_kw_min - grid_p)
-
-        pen_imp = self._grid_limit_penalty_fn(ex_imp, self.grid_limit_penalty, self.grid_limit_huber_delta)
-        pen_exp = self._grid_limit_penalty_fn(ex_exp, self.grid_limit_penalty, self.grid_limit_huber_delta)
-        reward_grid_limits = - self.lambda_grid_limits * (pen_imp + pen_exp) * dt_h
-
-        # ----- Penalização pelo clipping do safety layer -----
-        pen_clip = self._grid_limit_penalty_fn(clip_kw, self.clip_penalty, self.clip_huber_delta)
-        reward_clip = - self.lambda_clip * pen_clip * dt_h
-
-        # recompensa retornada
-        if self.is_training:
-            reward = float(reward_energy + reward_penalty + reward_shaping + reward_salvage
-                           + reward_grid_limits + reward_clip)
+    def _close_balance(self, served_load, pv_kw, Pdis, Pch):
+        residual = (served_load + Pch) - (pv_kw + Pdis)
+        Pgrid_in = Pgrid_out = Pcurt = 0.0
+        if residual >= 0.0:
+            take = min(residual, self.eds.Pmax_in) if np.isfinite(self.eds.Pmax_in) else residual
+            Pgrid_in += take; residual -= take
         else:
-            reward = float(reward_energy + reward_penalty
-                           + (reward_grid_limits if self.penalize_grid_limits_in_eval else 0.0)
-                           + (reward_clip if self.penalize_grid_limits_in_eval else 0.0))
+            surplus = -residual
+            give = min(surplus, self.eds.Pmax_out) if np.isfinite(self.eds.Pmax_out) else surplus
+            Pgrid_out += give; surplus -= give
+            Pcurt = max(0.0, surplus); residual = 0.0
+        cost = self._price(self.t) * (Pgrid_in * self.Δt_h) + self.c_curt * (Pcurt * self.Δt_h)
+        return dict(Pgrid_in_kw=Pgrid_in, Pgrid_out_kw=Pgrid_out, Curtailment_kw=Pcurt, residual_kw=float(residual), cost_total=float(cost))
 
-        # avança o índice
-        self.idx = next_idx if next_idx <= self.T else self.T
-        terminated = False
+    def _apply_ramp(self, Pb_des, Pb_prev):
+        if self.bess.ramp is None: return Pb_des
+        return float(np.clip(Pb_des, Pb_prev - self.bess.ramp, Pb_prev + self.bess.ramp))
 
-        # sinais de hora (para o script de avaliação)
-        tod_min = self._minutes_of_day(t_m)
-        sin_h = float(np.sin(2 * np.pi * (tod_min / 1440.0)))
-        cos_h = float(np.cos(2 * np.pi * (tod_min / 1440.0)))
+    def _discharge_cap(self):
+        return self.bess.ηd * max(self.E - self.bess.Emin, 0.0) / max(self.Δt_h, 1e-9)
 
-        info = {
-            "timestamp_m": t_m,
-            "price": price,
+    def _charge_cap(self):
+        return max(self.bess.Ecap - self.E, 0.0) / (max(self.bess.ηc, 1e-9) * max(self.Δt_h, 1e-9))
 
-            # Publica PV/Load
-            "pv_kw": pv,
-            "load_kw": ld,
+    def _price(self, ts): return float(self.ceds.get(f"{int(ts.hour):02d}:00", 0.0))
 
-            # BESS / GRID (antes e depois do safety)
-            "p_bess_cmd_kw": p_cmd,
-            "p_bess_eff_before_clip_kw": p_eff_phy,
-            "p_bess_eff_kw": p_eff_star,
-            "p_grid_before_clip_kw": ld - pv + p_eff_phy,
-            "p_grid_kw": grid_p,
+    def _obs(self):
+        t = self.t
+        ms, mc = np.sin(2*np.pi*t.month/12.0), np.cos(2*np.pi*t.month/12.0)
+        ds, dc = np.sin(2*np.pi*t.day/31.0),   np.cos(2*np.pi*t.day/31.0)
+        hs, hc = np.sin(2*np.pi*t.hour/24.0),  np.cos(2*np.pi*t.hour/24.0)
+        ws, wc = np.sin(2*np.pi*t.weekday()/7.0), np.cos(2*np.pi*t.weekday()/7.0)
+        Eb = self.E / self.bess.Emax
+        c  = self._price(t) / self.ceds_max
+        return np.array([ms, mc, ds, dc, hs, hc, ws, wc,
+                         self._last_pv_used / self.Pnorm,
+                         self._last_load_served / self.Pnorm,
+                         Eb, c], dtype=np.float32)
 
-            # Energia e penalizações
-            "e_buy_kwh": e_buy,
-            "e_sell_kwh": e_sell,
-            "violation_kwh": violation_kwh,
-            "grid_import_kw_max": self.grid_import_kw_max,
-            "grid_export_kw_min": self.grid_export_kw_min,
-            "grid_excess_import_kw": ex_imp,
-            "grid_excess_export_kw": ex_exp,
-            "clip_kw": clip_kw,
-
-            # Recompensas decompostas
-            "reward_energy": reward_energy,
-            "reward_penalty": reward_penalty,
-            "reward_shaping": reward_shaping,
-            "reward_salvage": reward_salvage,
-            "reward_grid_limits": reward_grid_limits,
-            "reward_clip": reward_clip,
-            "reward_returned": reward,
-            "is_training": self.is_training,
-            "safety_infeasible": safety_infeasible,
-
-            # Auxiliares de hora
-            "sin_h": sin_h,
-            "cos_h": cos_h,
-
-            # Estado
-            "soc": self.soc,
-        }
-        return obs_next, reward, terminated, truncated, info
-
-    # -------- observation helpers --------
-    def _obs_at(self, i: int) -> np.ndarray:
-        t_m = self.t[i]
-
-        # Tempo
-        tod_min = self._minutes_of_day(t_m)            # 0..1439
-        dow     = self._weekday_of(t_m)                # 0..6
-        mon_idx = self._month_index(t_m)               # 0..11
-        dim     = self._day_of_month_index(t_m)        # 0..(n_mês-1)
-        n_m     = self._days_in_month(t_m)             # 28..31
-
-        sin_tod = np.sin(2 * np.pi * (tod_min / 1440.0))
-        cos_tod = np.cos(2 * np.pi * (tod_min / 1440.0))
-        sin_dow = np.sin(2 * np.pi * (dow / 7.0))
-        cos_dow = np.cos(2 * np.pi * (dow / 7.0))
-        sin_mon = np.sin(2 * np.pi * (mon_idx / 12.0))
-        cos_mon = np.cos(2 * np.pi * (mon_idx / 12.0))
-        sin_dom = np.sin(2 * np.pi * (dim / max(1.0, float(n_m))))
-        cos_dom = np.cos(2 * np.pi * (dim / max(1.0, float(n_m))))
-
-        # Normalizações & relações PV↔demanda
-        pv_kw   = float(self.pv[i])
-        load_kw = float(self.ld[i])
-        price   = float(self.price[i])
-
-        pv_frac        = pv_kw   / max(self.pv_kw_max,   1e-6)
-        load_frac      = load_kw / max(self.load_kw_max, 1e-6)
-        net_load_frac  = (load_kw - pv_kw) / max(self.load_kw_max, 1e-6)
-
-        ratio_clip = 3.0
-        pv_to_load_ratio = pv_kw / max(load_kw, 1e-6)
-        pv_to_load_ratio = float(np.clip(pv_to_load_ratio, 0.0, ratio_clip))
-
-        price_norm = (price - self.price_min) / self._price_den
-
-        return np.array([
-            pv_frac, load_frac, pv_to_load_ratio, net_load_frac, price_norm,
-            sin_tod, cos_tod, sin_dow, cos_dow, sin_mon, cos_mon, sin_dom, cos_dom,
-            self.soc
-        ], dtype=np.float32)
-
-    def _obs(self) -> np.ndarray:
-        i = min(self.idx, max(self.T - 1, 0))
-        return self._obs_at(i)
+    def to_dataframe(self):
+        return pd.DataFrame(self._rows).set_index("timestamp") if self._rows else pd.DataFrame()

@@ -1,0 +1,79 @@
+{
+  "name": "model2",
+  "version": "1.4.1",
+  "hidden_dims": [128, 128],
+  "dropout": 0.0,
+  "log_std_min": -5.0,
+  "log_std_max": 2.0,
+
+  "obs": {
+    "normalized_inputs": true,
+    "history": {
+      "enabled": true,
+      "window": 1,          
+      "mode": "flat",        
+      "stride": 1,           
+      "padding": "edge"      
+    }
+  },
+  "imitation_learning": {
+    "horizon": 4800,
+    "timestep": 5,
+    "optimizer": { "type": "adam", "lr": 0.001, "weight_decay": 0.0 },
+    "loss": { "type": "mse", "delta": 1.0 },
+    "train": {
+      "batch_size": 256,
+      "epochs": 30,
+      "shuffle": true,
+      "val_split": 0.1,
+      "early_stopping_patience": 15,
+      "save_best_only": true,
+      "grad_clip": 0.0,
+      "num_workers": 0,
+      "seed": 42
+    }
+  },
+
+  "reinforcement_learning": {
+    "horizon": 48,
+    "timestep": 5,
+    "nenvs": 10,
+    "ndays": 100,
+    "warmup_random": false,
+    "train": {
+      "n_episodes": 1000,
+      "save_every_episodes": 50,
+      "lr_actor": 0.0003,
+      "lr_critic": 0.0003,
+      "lr_alpha": 0.0003,
+      "gamma": 0.995,
+      "tau": 0.01,
+      "auto_alpha": true,
+      "alpha_init": 0.1,
+      "target_entropy": -0.5,
+      "freeze_alpha_env_steps": 100000,
+      "alpha_clamp_min": 0.01,
+      "alpha_clamp_max": 0.2,
+      "batch_size": 256,
+      "buffer_capacity": 1000000,
+      "warmup_env_steps": 20000,
+      "updates_per_env_step": 0.5,
+      "max_grad_norm": 1.0,
+      "log_std_init": -0.5,
+      "log_std_clamp_min": -5.0,
+      "log_std_clamp_max": 2.0,
+      "bc_coef_max": 0.4,
+      "bc_coef_min": 0.0,
+      "bc_decay_env_steps": 1000000,
+      "policy_delay": 1,
+      "reward_scale": 0.1,
+      "pretrain_transitions": 100000,
+      "pretrain_epochs": 10,
+      "cql_lambda": 0.5,
+      "p_demo_init": 0.3,
+      "p_demo_final": 0.0,
+      "p_demo_decay_env_steps": 400000,
+      "seed": 42
+    }
+  }
+}

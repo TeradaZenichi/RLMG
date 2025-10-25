@@ -1,9 +1,12 @@
 {
   "time": {
-    "horizon_hours": 36,
+    "horizon_hours": 72,
     "timestep": 5
   },
   "costs": {
+    "bess_degradation_per_kwh": 0.05,
+    "load_shedding": 10.0,
+    "c_pv_curt_per_kwh": 0.0,
     "EDS": {
       "00:00": 0.40, "01:00": 0.40, "02:00": 0.40, "03:00": 0.40,
       "04:00": 0.40, "05:00": 0.40, "06:00": 0.40, "07:00": 0.40,
@@ -11,53 +14,38 @@
       "12:00": 0.40, "13:00": 0.40, "14:00": 0.40, "15:00": 0.40,
       "16:00": 0.40, "17:00": 0.40, "18:00": 0.70, "19:00": 0.70,
       "20:00": 0.70, "21:00": 0.70, "22:00": 0.40, "23:00": 0.40
-    },
-    "feedin_price": 0.00
+    }
   },
   "BESS": {
-    "Pmax_kw": 2.5,
-    "Emax_kwh": 5.0,
-    "DoD_frac": 0.90,
-    "E_init_kwh": 2.5,
-    "E_bess_kwh": 5.0,
-    "P_ch_max_kw": 2.5,
-    "P_dis_max_kw": 2.5,
+    "Pmax": 4.0,
+    "Emax": 8.0,
+    "DoD": 0.9,
+    "self_discharging": 0.05,
+    "soc_min": 0.0,
     "soc_max": 1.0,
-    "soc_min": 0.10,
-    "soc_init": 0.50,
-    "eta_ch": 0.95,
-    "eta_dis": 0.95,
-    "penalty_violation_kwh": 0.05
+    "efficiency": 0.95,
+    "ramp_kw_per_step": 2.0,
+    "noisy": false,
+    "noise": {
+      "type": "gauss",
+      "std_frac": 0.05,   
+      "std_kw": 0.0,      
+      "seed": 123     
+   }
   },
-  "PV":   { "Pmax_kw": 2.5 },
-  "Load": { "Pmax_kw": 5.0 },
-  "profiles": { "fL": [0.8], "fPV": [0.6] },
-  "training": {
-    "use_shaping": true,
-    "lambda_potential": 0.5,
-    "price_weight_by_hour": {
-      "00:00": 0.0, "01:00": 0.0, "02:00": 0.0, "03:00": 0.0,
-      "04:00": 0.0, "05:00": 0.0, "06:00": 0.2, "07:00": 0.2,
-      "08:00": 0.2, "09:00": 0.2, "10:00": 0.2, "11:00": 0.2,
-      "12:00": 0.2, "13:00": 0.2, "14:00": 0.2, "15:00": 0.2,
-      "16:00": 0.4, "17:00": 0.6, "18:00": 1.0, "19:00": 1.0,
-      "20:00": 1.0, "21:00": 1.0, "22:00": 0.4, "23:00": 0.2
-    },
-    "salvage_value_per_kwh": 0.20
+  "PV": {
+    "Pmax": 3.0,
+    "generation_file": "data/pv_5min_train.csv"
   },
-  "io": {
-    "pv_file": "pv_5min_train.csv",
-    "load_file": "load_5min_train.csv"
+  "Load": {
+    "Pmax": 6.0,
+    "load_file": "data/load_5min_train.csv"
   },
-
-  "grid_import_kw_max": 1.50,
-  "grid_export_kw_min": -1.00,
-  "lambda_grid_limits": 2.0,
-  "grid_limit_penalty": "huber",
-  "grid_limit_huber_delta": 0.25,
-  "penalize_grid_limits_in_eval": false,
-
-  "lambda_clip": 0.5,
-  "clip_penalty": "quadratic",
-  "clip_huber_delta": 0.25
+  "EDS": {
+    "Pmax_in": 7.5,
+    "Pmax_out": 2.0,
+    "outage_probability_pct": 50,
+    "outage_duration_std_dev_frac": 1.0,
+    "outage_duration_hours": 2
+  }
 }

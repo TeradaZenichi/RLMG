@@ -1,0 +1,51 @@
+{
+  "time": {
+    "horizon_hours": 240,
+    "timestep": 5
+  },
+  "costs": {
+    "EDS": {
+      "00:00": 0.40, "01:00": 0.40, "02:00": 0.40, "03:00": 0.40,
+      "04:00": 0.40, "05:00": 0.40, "06:00": 0.40, "07:00": 0.40,
+      "08:00": 0.40, "09:00": 0.40, "10:00": 0.40, "11:00": 0.40,
+      "12:00": 0.40, "13:00": 0.40, "14:00": 0.40, "15:00": 0.40,
+      "16:00": 0.40, "17:00": 0.40, "18:00": 0.70, "19:00": 0.70,
+      "20:00": 0.70, "21:00": 0.70, "22:00": 0.40, "23:00": 0.40
+    },
+    "feedin_price": 0.00
+  },
+  "BESS": {
+    "Pmax_kw": 2.5,
+    "Emax_kwh": 5.0,
+    "DoD_frac": 0.90,
+    "E_init_kwh": 2.5,
+    "E_bess_kwh": 5.0,
+    "P_ch_max_kw": 2.5,
+    "P_dis_max_kw": 2.5,
+    "soc_max": 1.0,
+    "soc_min": 0.10,
+    "soc_init": 0.50,
+    "eta_ch": 0.95,
+    "eta_dis": 0.95,
+    "penalty_violation_kwh": 0.05
+  },
+  "PV":   { "Pmax_kw": 2.5 },
+  "Load": { "Pmax_kw": 5.0 },
+  "profiles": { "fL": [0.8], "fPV": [0.6] },
+ 
+  "io": {
+    "pv_file": "pv_5min_train.csv",
+    "load_file": "load_5min_train.csv"
+  },
+
+  "grid_import_kw_max": 1.50,
+  "grid_export_kw_min": -1.00,
+  "lambda_grid_limits": 2.0,
+  "grid_limit_penalty": "huber",
+  "grid_limit_huber_delta": 0.25,
+  "penalize_grid_limits_in_eval": false,
+
+  "lambda_clip": 0.5,
+  "clip_penalty": "quadratic",
+  "clip_huber_delta": 0.25
+}

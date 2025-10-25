@@ -1,67 +1,57 @@
-# main.py — parallel sampling (sem NN), enxuto, com dias manuais
-from gymnasium.vector import AsyncVectorEnv
-from gymnasium.wrappers import TimeLimit
-import gymnasium as gym
-from environment import EnergyEnvSimpleNP
-from environment.config import EnergyEnvConfig
-import numpy as np
+# main.py
+import json
+from train.train_base import train as train_il
+from testing.test_base import test as test_il
+from train.train_rl import train as train_rl
 
-# Wrapper: injeta SEMPRE as options em todo reset (simples e robusto)
-class DefaultResetOptions(gym.Wrapper):
-    def __init__(self, env, options: dict):
-        super().__init__(env)
-        self._options = dict(options)
-    def reset(self, *, seed=None, options=None):
-        return self.env.reset(seed=seed, options=(options or self._options))
+def select_model(model_name: str):
+    model_name = model_name.lower()
+    if model_name == "td3mlp":
+        import models.td3mlp.model as m
+        config_path = "models/td3mlp/model.json"
+        return m.DeterministicTanhActor, m.MLPmodel, m.TwinQCritic, m.Hyperparameters, config_path
+    else:
+        raise ValueError(f"modelo desconhecido: {model_name}")
 
-def make_env(times_5m, pv_5m, ld_5m, cfg, dt, hz, start_date, align="next"):
-    def _thunk():
-        env = EnergyEnvSimpleNP(times_5m, pv_5m, ld_5m, cfg)
-        env = TimeLimit(env, max_episode_steps=cfg.steps(dt_minutes=dt, horizon_hours=hz))
-        env = DefaultResetOptions(env, {
-            "start_date": start_date,
-            "dt_minutes": dt,
-            "horizon_hours": hz,
-            "align": align
-        })
-        return env
-    return _thunk
+if __name__ == "__main__":
+    model_name = "td3mlp"  # default
+    actor_cls, model_cls, critics_cls, hp_cls, config_path = select_model(model_name) 
 
-if __name__ == "__main__":  # necessário no Windows (spawn)
-    # 1) Carrega config + base 5-min
-    cfg, times_5m, pv_5m, ld_5m = EnergyEnvConfig.from_parameters_json("data")
+    name = "td3mlp"
+    start_time = "2006-12-17 00:00:00"
+    start_soc  = 0.5  # fraction of Emax
 
-    # 2) Configura granularidade e horizonte
-    dt, hz = 15, 24
-    steps = cfg.steps(dt_minutes=dt, horizon_hours=hz)
+    # # Imitation learning approach
+    # res = train_il(
+    #     model_arch=model_cls,
+    #     hp_cls=hp_cls,
+    #     start_time=start_time,
+    #     start_soc=start_soc,
+    #     config_path=config_path,
+    #     model_name=model_name
+    # )
+    
+    # # Test the solution obtained by imitation learning
+    # res = test_il(
+    #     start_time=start_time,
+    #     start_soc=start_soc,
+    #     model_arch=model_cls,
+    #     hp_cls=hp_cls,
+    #     config_path=config_path,
+    #     name=name
+    # )
 
-    # 3) Informe os dias de início manualmente (YYYY-MM-DD)
-    user_start_days = ["2006-12-17", "2006-12-18", "2006-12-19", "2006-12-20"]
-
-    # Checagem leve: dia existe no dataset?
-    avail = set(map(str, np.unique(times_5m.astype("datetime64[D]"))))
-    missing = [d for d in user_start_days if d not in avail]
-    if missing:
-        dmin = str(times_5m.astype("datetime64[D]").min())
-        dmax = str(times_5m.astype("datetime64[D]").max())
-        raise ValueError(f"Start day(s) not in dataset: {missing}. Available range: {dmin} → {dmax}")
-
-    # 4) Cria vetor de ambientes (um por dia)
-    venv = AsyncVectorEnv([make_env(times_5m, pv_5m, ld_5m, cfg, dt, hz, d) for d in user_start_days])
-
-    # 5) Reset vetorizado (cada subenv injeta suas options)
-    obs, infos = venv.reset()
-
-    # 6) Coleta até o TimeLimit
-    returns = np.zeros(len(user_start_days), dtype=np.float32)
-    for _ in range(steps):
-        actions = venv.action_space.sample()  # (n_envs, act_dim)
-        obs, rewards, terms, truncs, infos = venv.step(actions)
-        returns += rewards.astype(np.float32)
-
-        # opcional: para episódios contínuos, recomece só os que terminaram
-        # venv.reset_done()
-
-    print(f"[parallel] dt={dt} min, horizon={hz} h, steps={steps}, n_envs={len(user_start_days)}")
-    print("returns per env:", returns)
-    print("mean return:", float(returns.mean()))
+    #fine tunning using reinforcement learning
+    weights_path = "saves/td3mlp/best.pt"
+    weights_path = None
+    res = train_rl(
+        actor_arch=actor_cls,
+        model_arch=model_cls,
+        critics_arch = critics_cls,
+        hp_cls=hp_cls,
+        start_time=start_time,
+        start_soc=start_soc,
+        config_path=config_path,
+        model_name=model_name,
+        model_weights = weights_path
+    )
