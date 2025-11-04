@@ -39,29 +39,83 @@ class ImitationLearning:
         self.raw = cfg
 
 
+
 class ReinforcementLearning:
-    def __init__(self, cfg: Optional[Dict[str, Any]] = None):
+    def __init__(self, cfg=None):
         cfg = dict(cfg or {})
         opt = dict(cfg.get("optimizer", {}))
         trn = dict(cfg.get("train", {}))
-        
 
-        # Treino (ambiente / episódios)
-        self.horizon       = int(cfg.get("horizon", 24))
-        self.timestep      = float(cfg.get("timestep", 5.0))
-        self.nenvs         = int(cfg.get("nenvs", 1))
-        self.ndays         = int(cfg.get("ndays", 7))
-        self.stride_hours  = int(cfg.get("stride_hours", 24))   # pode estar obsoleto, mas mantido
-        self.n_episodes    = int(trn.get("n_episodes", 1000))
-        
-        # Otimizadores
-        self.opt_type      = str(opt.get("type", "adam")).lower()
-        base_lr            = float(opt.get("lr", 1e-3))
-        self.lr_actor      = float(trn.get("lr_actor", base_lr))
-        self.lr_critic     = float(trn.get("lr_critic", base_lr))
-        self.lr_alpha      = float(trn.get("lr_alpha", 3e-4))
-        self.weight_decay  = float(opt.get("weight_decay", 0.0))
-        self.warmup_random = bool(cfg.get("warmup_random", False))
+        # ----- Environment / data collection -----
+        self.buffer_size = int(trn.get("buffer_size", 1e6))
+        self.horizon = int(cfg.get("horizon", 24))
+        self.timestep = float(cfg.get("timestep", 5.0))
+        self.nenvs = int(cfg.get("nenvs", 1))
+        self.ndays = int(cfg.get("ndays", 7))
+        self.stride_hours = int(cfg.get("stride_hours", 24))
+        self.n_episodes = int(trn.get("n_episodes", 100))
+
+        # Observation window override if desired
+        self.window_size = int(cfg.get("window_size", trn.get("window_size", 1)))
+
+        # ----- Optimizers -----
+        self.opt_type = str(opt.get("type", "adam")).lower()
+        self.lr_actor = float(trn.get("lr_actor", 1e-4))
+        self.lr_critic = float(trn.get("lr_critic", 1e-3))
+        self.lr_alpha = float(trn.get("lr_alpha", 3e-4))
+        self.weight_decay = float(opt.get("weight_decay", 0.0))
+
+        # ----- Buffer / batching -----
+        self.batch_size = int(trn.get("batch_size", 256))
+
+        # Legacy warmup controls
+        self.warmup_random = bool(cfg.get("warmup_random", trn.get("warmup_random", False)))
+        self.start_steps = int(trn.get("start_steps", 0))
+        self.warmup_utd = float(trn.get("warmup_utd", 1))
+
+        # ----- TD3 / DDPG core -----
+        self.gamma = float(trn.get("gamma", 0.99))
+        self.tau = float(trn.get("tau", 0.005))
+        self.policy_delay = int(trn.get("policy_delay", 2))
+        self.policy_noise = float(trn.get("policy_noise", 0.1))
+        self.noise_clip = float(trn.get("noise_clip", 0.2))
+        self.utd = float(trn.get("utd", 1))
+
+        # ----- Scheduler of updates and exploration -----
+        self.update_every = int(trn.get("update_every", 1))
+        self.max_updates_per_step = int(trn.get("max_updates_per_step", 1))
+        self.exploration_noise = float(trn.get("exploration_noise", 0.03))
+
+        # >>>>>>> NOVOS CAMPOS (do JSON atualizado) <<<<<<<
+        self.warmup_episodes = int(trn.get("warmup_episodes", 0))
+        self.eval_every = int(trn.get("eval_every", 0))
+        self.anneal_episodes = int(trn.get("anneal_episodes", self.n_episodes))
+
+        self.exploration_noise_final = float(trn.get("exploration_noise_final", self.exploration_noise))
+        self.policy_noise_final = float(trn.get("policy_noise_final", self.policy_noise))
+        self.noise_clip_final = float(trn.get("noise_clip_final", self.noise_clip))
+        self.lambda_bc_final = float(trn.get("lambda_bc_final", trn.get("lambda_bc", 0.0)))
+
+        # ----- Critic pretrain and behavior regularization -----
+        self.critic_pretrain_steps = int(trn.get("critic_pretrain_steps", 10000))
+        self.pretrain_noise = float(trn.get("pretrain_noise", 0.02))
+        self.lambda_bc = float(trn.get("lambda_bc", 0.001))
+
+        # ----- Numerics and logging -----
+        self.max_grad_norm = float(trn.get("max_grad_norm", 10.0))
+        self.save_every = int(trn.get("save_every", 50))
+        self.seed = int(trn.get("seed", 42))
+
+        # ----- Loss knobs -----
+        self.use_huber = bool(trn.get("use_huber", True))
+        self.huber_delta = float(trn.get("huber_delta", 1.0))
+
+
+    def to_dict(self):
+        return self.__dict__
+
+
+
 
        
 

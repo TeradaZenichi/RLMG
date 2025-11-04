@@ -170,7 +170,7 @@ def train(start_time: str, start_soc: float,
     dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False,                    num_workers=int(il.num_workers))
 
     save_dir = Path(f"saves/{model_name}"); save_dir.mkdir(parents=True, exist_ok=True)
-    best_ckpt = save_dir / "best.pt"
+    best_ckpt = save_dir / "best_il.pt"
     hp_path   = save_dir / "hp.json"
 
     best_val = float("inf")
